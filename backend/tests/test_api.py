@@ -67,3 +67,60 @@ def test_rate_limit_returns_429(client, monkeypatch):
     codes = [client.post("/api/query", json={"text": "coral"}).status_code for _ in range(3)]
     assert codes == [200, 200, 429]
     main._query_hits.clear()
+
+
+def test_neighbors_exclude_self_and_are_ranked(client):
+    chunk_id = client.get("/api/map").json()["points"][0]["id"]
+    body = client.get(f"/api/neighbors/{chunk_id}", params={"k": 4}).json()
+    assert body["chunk_id"] == chunk_id
+    # The list is the union of the top 4 under cosine, Euclidean and map distance, best cosine first.
+    assert len(body["neighbors"]) >= 4
+    assert chunk_id not in [n["chunk_id"] for n in body["neighbors"]]
+    scores = [n["score"] for n in body["neighbors"]]
+    assert scores == sorted(scores, reverse=True)
+    assert [n["rank"] for n in body["neighbors"]][:4] == [1, 2, 3, 4]
+
+
+def test_neighbors_reject_unknown_chunk_and_bad_k(client):
+    assert client.get("/api/neighbors/nope:0").status_code == 404
+    chunk_id = client.get("/api/map").json()["points"][0]["id"]
+    assert client.get(f"/api/neighbors/{chunk_id}", params={"k": 99}).status_code == 422
+
+
+def test_neighbors_rate_limit_is_separate_from_queries(client, monkeypatch):
+    chunk_id = client.get("/api/map").json()["points"][0]["id"]
+    monkeypatch.setattr(main.config, "NEIGHBOR_RATE_PER_MIN", 1)
+    main._neighbor_hits.clear()
+    main._query_hits.clear()
+    assert client.get(f"/api/neighbors/{chunk_id}").status_code == 200
+    assert client.get(f"/api/neighbors/{chunk_id}").status_code == 429
+    assert client.post("/api/query", json={"text": "coral"}).status_code == 200
+    main._neighbor_hits.clear()
+    main._query_hits.clear()
+
+
+def test_query_returns_all_three_metrics_with_ranks(client):
+    body = client.post("/api/query", json={"text": "espresso brewing pressure", "k": 3}).json()
+    for m in body["matches"]:
+        assert set(m["ranks"]) == {"cosine", "euclidean", "map"}
+        assert m["rank"] == m["ranks"]["cosine"]
+        # unit vectors: d^2 = 2 - 2*cos (values are rounded, so allow a small tolerance)
+        assert abs(m["euclidean"] ** 2 - (2 - 2 * m["score"])) < 1e-3
+        assert m["map_distance"] >= 0
+    # every chunk in the union is in the top 3 under at least one metric
+    assert all(min(m["ranks"].values()) <= 3 for m in body["matches"])
+
+
+def test_cosine_and_euclidean_rank_identically_on_unit_vectors(client):
+    body = client.post("/api/query", json={"text": "how do coral reefs bleach", "k": 5}).json()
+    by_cosine = sorted(body["matches"], key=lambda m: m["ranks"]["cosine"])
+    by_euclid = sorted(body["matches"], key=lambda m: m["ranks"]["euclidean"])
+    assert [m["chunk_id"] for m in by_cosine] == [m["chunk_id"] for m in by_euclid]
+
+
+def test_neighbors_carry_all_metrics(client):
+    chunk_id = client.get("/api/map").json()["points"][0]["id"]
+    for n in client.get(f"/api/neighbors/{chunk_id}", params={"k": 3}).json()["neighbors"]:
+        assert set(n["ranks"]) == {"cosine", "euclidean", "map"}
+        assert chunk_id != n["chunk_id"]
+        assert n["map_distance"] > 0

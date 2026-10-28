@@ -23,6 +23,47 @@ COORD_SCALE = 100.0  # positions are scaled so the largest coordinate is about t
 MIN_CHUNKS = 5  # UMAP needs a few points to build its neighbour graph
 
 
+METRICS = ("cosine", "euclidean", "map")
+
+
+def _ranks(order_key: np.ndarray) -> np.ndarray:
+    """1-based rank of every item when sorted ascending by order_key (stable, so ties keep input order)."""
+    order = np.argsort(order_key, kind="stable")
+    ranks = np.empty(len(order_key), dtype=np.int64)
+    ranks[order] = np.arange(1, len(order_key) + 1)
+    return ranks
+
+
+def compare_chunks(similarities: np.ndarray, map_distances: np.ndarray, k: int) -> list[dict]:
+    """Score every chunk three ways and keep those that make the top k under any of them.
+
+    - cosine: similarity on the full vectors (higher is closer).
+    - euclidean: straight-line distance between the full vectors. Vectors are unit length, so
+      d^2 = 2 - 2*cos and the ranking is the same as cosine's.
+    - map: distance between the 3D UMAP positions. This is a distorted picture of the full
+      space, so its ranking can disagree with the other two.
+    Use -inf similarity / inf map distance to exclude an item (e.g. the chunk itself).
+    """
+    euclidean = np.sqrt(np.clip(2.0 - 2.0 * similarities, 0.0, None))
+    ranks = {
+        "cosine": _ranks(-similarities),
+        "euclidean": _ranks(euclidean),
+        "map": _ranks(map_distances),
+    }
+    keep = np.flatnonzero(np.minimum.reduce([ranks[m] for m in METRICS]) <= k)
+    keep = keep[np.argsort(ranks["cosine"][keep], kind="stable")]
+    return [
+        {
+            "index": int(i),
+            "cosine": round(float(similarities[i]), 4),
+            "euclidean": round(float(euclidean[i]), 4),
+            "map_distance": round(float(map_distances[i]), 2),
+            "ranks": {m: int(ranks[m][i]) for m in METRICS},
+        }
+        for i in keep
+    ]
+
+
 @dataclass(frozen=True)
 class ChunkRecord:
     id: str
@@ -39,6 +80,8 @@ class VectorStore:
         self.chunks: list[ChunkRecord] = []
         self.doc_titles: dict[str, str] = {}
         self._matrix: np.ndarray | None = None
+        self._index_by_id: dict[str, int] = {}
+        self._xyz: np.ndarray | None = None
         self._reducer: umap.UMAP | None = None
         self._center: np.ndarray | None = None
         self._scale: float = 1.0
@@ -85,7 +128,9 @@ class VectorStore:
 
         with self._lock:
             self.chunks = chunks
+            self._index_by_id = {c.id: i for i, c in enumerate(chunks)}
             self._matrix = embeddings
+            self._xyz = np.asarray([c.xyz for c in chunks], dtype=np.float32)
             self._reducer = reducer
             self._center = center
             self._scale = scale
@@ -112,6 +157,34 @@ class VectorStore:
             for c in self.chunks
         ]
 
+    def neighbors(self, chunk_id: str, k: int = 5) -> list[dict] | None:
+        """The chunks closest to one chunk, scored by cosine, Euclidean and 3D map distance.
+
+        Returns None for an unknown chunk id. The chunk itself is never in its own list. A chunk
+        is included if it is in the top k under any metric; each carries its rank under all three.
+        """
+        index = self._index_by_id.get(chunk_id)
+        matrix, xyz = self._matrix, self._xyz
+        if index is None or matrix is None or xyz is None:
+            return None
+        similarities = matrix @ matrix[index]
+        map_distances = np.linalg.norm(xyz - xyz[index], axis=1)
+        similarities[index] = -np.inf
+        map_distances[index] = np.inf
+        return [
+            {
+                "chunk_id": self.chunks[row["index"]].id,
+                "doc_title": self.chunks[row["index"]].doc_title,
+                "text": self.chunks[row["index"]].text,
+                "score": row["cosine"],
+                "euclidean": row["euclidean"],
+                "map_distance": row["map_distance"],
+                "ranks": row["ranks"],
+                "rank": row["ranks"]["cosine"],
+            }
+            for row in compare_chunks(similarities, map_distances, min(k, len(self.chunks) - 1))
+        ]
+
     def query(self, text: str, k: int = 5) -> dict:
         pieces = split_query(text)
         if not pieces:
@@ -127,6 +200,8 @@ class VectorStore:
             query_xyz = (reducer.transform(query_vectors) - center) / scale * COORD_SCALE
 
         similarities = query_vectors @ matrix.T  # cosine, because all vectors are normalized
+        xyz = self._xyz
+        assert xyz is not None
         top_k = min(k, len(self.chunks))
 
         query_points = []
@@ -139,17 +214,20 @@ class VectorStore:
                     "xyz": [float(v) for v in query_xyz[piece_index]],
                 }
             )
-            order = np.argsort(-similarities[piece_index])[:top_k]
-            for rank, chunk_index in enumerate(order, start=1):
-                chunk = self.chunks[int(chunk_index)]
+            map_distances = np.linalg.norm(xyz - query_xyz[piece_index], axis=1)
+            for row in compare_chunks(similarities[piece_index], map_distances, top_k):
+                chunk = self.chunks[row["index"]]
                 matches.append(
                     {
                         "query_point_id": f"q:{piece_index}",
                         "chunk_id": chunk.id,
                         "doc_title": chunk.doc_title,
                         "text": chunk.text,
-                        "score": round(float(similarities[piece_index, chunk_index]), 4),
-                        "rank": rank,
+                        "score": row["cosine"],
+                        "euclidean": row["euclidean"],
+                        "map_distance": row["map_distance"],
+                        "ranks": row["ranks"],
+                        "rank": row["ranks"]["cosine"],
                     }
                 )
         return {"query_points": query_points, "matches": matches}

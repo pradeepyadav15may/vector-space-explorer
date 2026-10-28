@@ -13,10 +13,17 @@ query appears on the map, with lines to the chunks that match it, ranked by simi
   using cosine similarity. The top matches are listed and linked on the map.
 - **Honest 3D:** UMAP squeezes 384 dimensions into 3, so distances on the map are approximate. Ranking uses
   the full vectors, so the list is always the true ordering.
+- **Three ways to measure closeness:** a toolbar toggle switches between **Cosine**, **Euclidean** and **Map distance**.
+  The vectors have length 1, so `d² = 2 − 2·cos` and cosine and Euclidean always rank identically (the toggle shows
+  the angle and the chord between two vectors to explain why). Map distance ranks by the 3D dots instead, so
+  where it disagrees with cosine you are seeing the projection's distortion.
+- **Explore the map:** hover or click a dot to focus it and dim the rest, see its most similar chunks, fly the camera
+  to it, hide documents from the legend, and use the toolbar for view presets, auto-rotate, labels and sliders.
+  Keys: `Esc` clears, `R` resets the view, arrow keys step through matches.
 
 ## Run it locally
 
-You need Python 3.10+ and Node 20+. The first run downloads the embedding model (about 130 MB) once.
+You need Python 3.10 to 3.14 (`onnxruntime`, which the embedder needs, has no wheels for 3.15 yet) and Node 20+. The first run downloads the embedding model (about 130 MB) once.
 
 ```bash
 # 1. Backend
@@ -54,13 +61,14 @@ The first `# Heading` in a file becomes its title. The index is rebuilt in memor
 | `VSE_EMBEDDER` | `fastembed` | `fastembed` = real local model. `hash` = offline stand-in for tests (lexical only) |
 | `VSE_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Any model supported by fastembed |
 | `VSE_QUERY_RATE_PER_MIN` | `30` | Queries per minute per client IP |
+| `VSE_NEIGHBOR_RATE_PER_MIN` | `120` | Similar-chunk lookups per minute per client IP |
 | `VSE_CHUNK_MAX_WORDS` / `VSE_CHUNK_OVERLAP_WORDS` | `90` / `15` | Chunk size and overlap |
 
 ## Tests
 
 ```bash
 cd backend
-pytest
+python -m pytest
 ```
 
 The tests use the offline `hash` embedder, so they run without downloading a model.
@@ -68,9 +76,14 @@ The tests use the offline `hash` embedder, so they run without downloading a mod
 ## Architecture
 
 - `backend/app/store.py`: the in-memory index (chunks, embeddings, 3D positions, UMAP reducer).
-- `backend/app/main.py`: FastAPI routes `/api/health`, `/api/map`, `/api/query`, plus the built web app.
-- `frontend/src/Scene.tsx`: 3D view with `react-force-graph-3d` and fixed positions.
-- `frontend/src/App.tsx`: query panel, ranked results, and the details view.
+- `backend/app/main.py`: FastAPI routes `/api/health`, `/api/map`, `/api/query`, `/api/neighbors/{chunk_id}`, plus the
+  built web app. Queries and neighbours return every chunk that is in the top k under *any* metric, each with its
+  cosine, Euclidean and map-distance values and its rank under all three, so switching metric needs no new request.
+- `frontend/src/Scene.tsx`: 3D view with `react-force-graph-3d` and fixed positions: focus and dim, fly-to, labels,
+  the neighbourhood ring.
+- `frontend/src/App.tsx`: query panel, ranked results, details, and the keyboard shortcuts.
+- `frontend/src/Toolbar.tsx`, `Legend.tsx`, `PairGeometry.tsx`: map controls, document filter, and the angle/chord diagram.
+- `frontend/src/settings.ts`, `focus.ts`, `metrics.ts`: the view settings (in memory), which nodes stay bright, and metric helpers.
 
 ## Limitations
 
